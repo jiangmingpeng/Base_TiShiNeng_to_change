@@ -1,12 +1,12 @@
 import hashlib
-import time
 import urllib.parse
-import httpx
 from loguru import logger
+import tsn_fingerprint
+import tsn_signer
 
 class TiShiNengSdkBase:
 
-    def __init__(self, uid, schoolId, deviceId, brandName, deviceNum, token):
+    def __init__(self, uid, schoolId, deviceId, brandName, deviceNum, token, session=None, proxy=None):
         self.uid = uid
         self.schoolId = schoolId
         self.deviceId = deviceId
@@ -16,12 +16,21 @@ class TiShiNengSdkBase:
         self.appSecret = 'e8167ef026cbc5e456ab837d9d6d9254'
         self.appSign = '7F:C0:22:E6:7C:7D:2A:CC:C3:C8:77:0A:46:13:8D:C3'
         self.apiUrl = 'https://m.boxkj.com'
+        self._host = 'm.boxkj.com'
         self.platform = '1'
-        self.versionName = '2.0.23'
+        self.versionName = tsn_fingerprint.OKHTTP_VERSION_NAME
         self.version = '20230'
-        self.httpClient = httpx.AsyncClient()
+        # 统一出口客户端：业务层不再直接构造 httpx.AsyncClient
+        self.httpClient = session or tsn_fingerprint.TsnHttpSession(proxy=proxy)
         self.token = token
-        self.headers = {'Host': 'm.boxkj.com', 'token': self.token, 'channel': 'Android', 'version': self.version, 'type': '0', 'Content-Type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip', 'user-agent': 'okhttp/4.9.0'}
+        self.baseHeaders = {'token': self.token, 'channel': 'Android', 'version': self.version, 'type': '0'}
+        self.headers = self.baseHeaders
+
+    def buildHeaders(self, extra=None):
+        """OkHttp4 顺序的 header 列表（顺序本身是指纹的一部分）。"""
+        merged = dict(self.baseHeaders)
+        merged.update(extra or {})
+        return tsn_fingerprint.build_headers(self._host, content_type='application/x-www-form-urlencoded', extra=merged)
 
     @staticmethod
     def kVtoStr(key, value, is_encoded):
@@ -29,7 +38,7 @@ class TiShiNengSdkBase:
             try:
                 encoded_value = urllib.parse.quote(value)
                 return f'{key}={encoded_value}'
-            except Exception as e:
+            except Exception:
                 return f'{key}={value}'
         else:
             return f'{key}={value}'
@@ -39,24 +48,18 @@ class TiShiNengSdkBase:
         return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     def getSign(self, params: dict):
+        ctx = tsn_signer.SignContext(token=self.token, timestamp='', app_id='move', app_secret=self.appSecret)
+        signature = tsn_signer.resolve_signer('2.0.23:base').sign('/api', params, ctx)['sign']
         params.update({'appId': 'move', 'appSecret': self.appSecret})
-        keys = list(params.keys())
-        keys.sort()
-        result = []
-        for key in keys:
-            value = params[key]
-            result.append(self.kVtoStr(key, value, False))
-        concatenated_string = '&'.join(result)
-        logger.debug(concatenated_string)
-        return hashlib.md5(concatenated_string.encode()).hexdigest()
+        return signature
 
     async def httpPost(self, url, data):
         url = self.apiUrl + url
         try:
-            data['timestamp'] = str(int(time.time() * 1000))
+            data['timestamp'] = tsn_fingerprint.now_ms()
             sign = self.getSign(data.copy())
             data['sign'] = sign
-            resp = await self.httpClient.post(url=url, data=data, headers=self.headers)
+            resp = await self.httpClient.post(url=url, data=data, headers=self.buildHeaders())
             if resp.status_code == 200:
                 resp = resp.json()
                 if resp['returnCode'] == '200':

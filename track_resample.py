@@ -1,13 +1,12 @@
 from __future__ import annotations
 import math
 import random
-from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 from track_log import logger
 from track_clean import CleanOptions, clean_track
 from track_geo import LocalProjection, haversine_distance, normalize_points
-from track_metrics import steps_for_interval, stride_for_speed
+from track_metrics import stride_for_speed
 
 class TrackGenerationError(ValueError):
     pass

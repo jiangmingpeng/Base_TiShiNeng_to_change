@@ -1,4 +1,3 @@
-import uuid
 from loguru import logger
 from TiShiNengError import TiShiNengError
 from TiShiNengSdkPrivate import TiShiNengPrivate
@@ -8,23 +7,28 @@ from deviceModel import deviceModel
 from models import TsnAccount_Model
 from services.tsnAccount.tsnAccountDao import updateAccessToken, getTsnAccountByid, getTsnAccountByUid, addTsnAccount
 from services.tsnSchool.tsnSchoolDao import getSchoolBySchoolId
+import tsn_device
+import tsn_runtime
 
-async def getPublicVersionClient(accountModel: TsnAccount_Model):
+def _device_fields(accountModel, runtime=None):
+    """设备字段全部来自账号自己的设备档案，不再用全局 deviceModel 单例。"""
+    if runtime is not None:
+        d = runtime.device
+        return (d.android_id, d.manufacturer, d.model, d.os_version, ','.join(['arm64-v8a', 'armeabi-v7a', 'armeabi']))
+    return (accountModel.mobile_device_id, deviceModel.brand, deviceModel.model, deviceModel.osver, deviceModel.a_list)
+
+async def getPublicVersionClient(accountModel: TsnAccount_Model, runtime=None):
     schoolId = accountModel.school_id
     uid = accountModel.user_id
     schoolCode = accountModel.school.school_code
     openId = accountModel.school.open_id
     lan_url = accountModel.school.lan_url
-    deviceId = accountModel.mobile_device_id
-    brandName = deviceModel.brand
-    deviceNum = deviceModel.model
-    osVersion = deviceModel.osver
-    a_list = deviceModel.a_list
+    deviceId, brandName, deviceNum, osVersion, a_list = _device_fields(accountModel, runtime)
     access_token = accountModel.access_token
     fresh_token = accountModel.refresh_token
     username = accountModel.username
     password = accountModel.password
-    tsn = TiShiNengSdkPublic(uid, schoolId, schoolCode, openId, deviceId, brandName, deviceNum, osVersion, access_token, a_list)
+    tsn = TiShiNengSdkPublic(uid, schoolId, schoolCode, openId, deviceId, brandName, deviceNum, osVersion, access_token, a_list, session=(runtime.http if runtime else None))
     if lan_url != '' and lan_url is not None:
         tsn.setCloudUrl(lan_url)
     try:
@@ -49,20 +53,18 @@ async def getPublicVersionClient(accountModel: TsnAccount_Model):
             raise e
     return tsn
 
-async def getPrivateVersionClient(accountModel: TsnAccount_Model):
+async def getPrivateVersionClient(accountModel: TsnAccount_Model, runtime=None):
     schoolId = accountModel.school_id
     uid = accountModel.user_id
     schoolCode = accountModel.school.school_code
     openId = accountModel.school.open_id
     school_url = accountModel.school.school_url
     isOpenEncry = accountModel.school.is_open_encry
-    deviceId = accountModel.mobile_device_id
-    brandName = deviceModel.brand
-    deviceNum = deviceModel.model
+    deviceId, brandName, deviceNum, _osVersion, _abi = _device_fields(accountModel, runtime)
     access_token = accountModel.access_token
     username = accountModel.username
     password = accountModel.password
-    tsn = TiShiNengPrivate(uid, schoolId, schoolCode, isOpenEncry, deviceId, brandName, deviceNum, access_token)
+    tsn = TiShiNengPrivate(uid, schoolId, schoolCode, isOpenEncry, deviceId, brandName, deviceNum, access_token, session=(runtime.http if runtime else None))
     tsn.setSchoolUrl(school_url)
     tsn.setAppId(openId)
     try:
@@ -83,31 +85,41 @@ async def getPrivateVersionClient(accountModel: TsnAccount_Model):
 
 async def getTsnClientById(accountId, session):
     account: TsnAccount_Model = await getTsnAccountByid(accountId, session)
+    runtime = await tsn_runtime.build_runtime(account, session)
     if account.school.sys_type == 2:
-        return await getPublicVersionClient(account)
+        tsn = await getPublicVersionClient(account, runtime)
     elif account.school.sys_type == 1:
-        return await getPrivateVersionClient(account)
+        tsn = await getPrivateVersionClient(account, runtime)
     else:
         raise TiShiNengError('未知的系统类型', 10001)
+    tsn.runtime = runtime
+    return tsn
 
 async def getTsnClientByUid(uid, session):
     account: TsnAccount_Model = await getTsnAccountByUid(uid, session)
+    runtime = await tsn_runtime.build_runtime(account, session)
     if account.school.sys_type == 2:
-        return await getPublicVersionClient(account)
+        tsn = await getPublicVersionClient(account, runtime)
     elif account.school.sys_type == 1:
-        return await getPrivateVersionClient(account)
+        tsn = await getPrivateVersionClient(account, runtime)
     else:
         raise TiShiNengError('未知的系统类型', 10001)
+    tsn.runtime = runtime
+    return tsn
 
 async def tsnPasswordAuthServer(schoolId, userName, password, session):
     schoolModel = await getSchoolBySchoolId(schoolId, session)
     if not schoolModel:
         raise TiShiNengError('学校不存在')
-    brandName = deviceModel.brand
-    deviceNum = deviceModel.model
-    osVersion = deviceModel.osver
-    a_list = deviceModel.a_list
-    deviceId = str(uuid.uuid4())
+    # 设备身份由学校 + 学号确定性派生：重新授权/换库都不会换机
+    device_key = tsn_device.device_key_for(schoolId, userName)
+    device = tsn_device.provision_device(0, getattr(schoolModel, 'province_name', None), key=device_key)
+    tsn_device.assert_device_consistent(device)
+    brandName = device.manufacturer
+    deviceNum = device.model
+    osVersion = device.os_version
+    a_list = device.abi + ',armeabi-v7a,armeabi'
+    deviceId = device.android_id
     if schoolModel.isPublicVersion():
         tsn = TiShiNengSdkPublic(0, schoolId, schoolModel.school_code, schoolModel.open_id, deviceId, brandName, deviceNum, osVersion, '', a_list)
         if schoolModel.lan_url != '' and schoolModel.lan_url is not None:
@@ -148,6 +160,7 @@ async def tsnPasswordAuthServer(schoolId, userName, password, session):
             await addTsnAccount(tsnAccountModel, session)
         else:
             await session.flush()
+        await tsn_runtime.ensure_device(tsnAccountModel, session)
         return uid
     else:
         tsn = TiShiNengPrivate(0, schoolId, schoolModel.school_code, schoolModel.is_open_encry, deviceId, brandName, deviceNum, '')
@@ -177,5 +190,6 @@ async def tsnPasswordAuthServer(schoolId, userName, password, session):
             await addTsnAccount(tsnAccountModel, session)
         else:
             await session.flush()
+        await tsn_runtime.ensure_device(tsnAccountModel, session)
         sysUid = f'{schoolId}:{uid}'
         return sysUid

@@ -7,10 +7,12 @@ from AesUtils import AESCrypto
 from RsaUtils import RSACrypto
 from TiShiNengError import TiShiNengError
 from TiShiNengSdkBase import TiShiNengSdkBase
+import tsn_fingerprint
+import tsn_signer
 
 class TiShiNengPrivate:
 
-    def __init__(self, uid, schoolId, schoolCode, isOpenEncry, deviceId, brandName, deviceNum, token):
+    def __init__(self, uid, schoolId, schoolCode, isOpenEncry, deviceId, brandName, deviceNum, token, session=None, proxy=None):
         self.uid = uid
         self.schoolCode = schoolCode
         self.isOpenEncry = isOpenEncry
@@ -23,13 +25,21 @@ class TiShiNengPrivate:
         self.appSign = '7F:C0:22:E6:7C:7D:2A:CC:C3:C8:77:0A:46:13:8D:C3'
         self.schoolUrl = ''
         self.platform = '1'
-        self.tiShiNengBaseClient = TiShiNengSdkBase(uid, schoolId, deviceId, brandName, deviceNum, token)
+        self._host = None
+        self.tiShiNengBaseClient = TiShiNengSdkBase(uid, schoolId, deviceId, brandName, deviceNum, token, session=session, proxy=proxy)
         self.versionName = self.tiShiNengBaseClient.versionName
         self.httpClient = self.tiShiNengBaseClient.getHttpClient()
         self.useXieQu = False
         self.token = token
         self.rsaUtils = RSACrypto('MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq4laolA7zAk7jzsqDb3Oa5pS/uCPlZfASK8Soh/NzEmry77QDZ2koyr96M5Wx+A9cxwewQMHzi8RoOfb3UcQO4UDQlMUImLuzUnfbk3TTppijSLH+PU88XQxcgYm2JTa546c7JdZSI6dBeXOJH20quuxWyzgLk9jAlt3ytYygPQ7C6o6ZSmjcMgE3xgLaHGvixEVpOjL/pdVLzXhrMqWVAnB/snMjpCqesDVTDe5c6OOmj2q5J8n+tzIXtnvrkxQSDaUp8DWF8meMwyTErmYklMXzKic2rjdYZpHh4x98Fg0Q28sp6i2ZoWiGrJDKW29mntVQQiDNhKDawb4B45zUwIDAQAB')
-        self.headers = {'token': self.token, 'channel': 'Android', 'version': self.tiShiNengBaseClient.version, 'type': '0', 'Content-Type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip', 'user-agent': 'okhttp/4.9.0'}
+        self.baseHeaders = {'token': self.token, 'channel': 'Android', 'version': self.tiShiNengBaseClient.version, 'type': '0'}
+        self.headers = self.baseHeaders
+
+    def buildHeaders(self, content_type='application/x-www-form-urlencoded', extra=None):
+        """OkHttp4 顺序的 header 列表；multipart 时传 content_type=None 由客户端补 boundary。"""
+        merged = dict(self.baseHeaders)
+        merged.update(extra or {})
+        return tsn_fingerprint.build_headers(self._host or 'localhost', content_type=content_type, extra=merged)
 
     def isPublic(self):
         return False
@@ -40,7 +50,7 @@ class TiShiNengPrivate:
             try:
                 encoded_value = urllib.parse.quote(value)
                 return f'{key}={encoded_value}'
-            except Exception as e:
+            except Exception:
                 return f'{key}={value}'
         else:
             return f'{key}={value}'
@@ -58,12 +68,16 @@ class TiShiNengPrivate:
 
     def setAccessToken(self, token):
         self.token = token
-        self.headers = {'token': self.token, 'channel': 'Android', 'version': self.tiShiNengBaseClient.version, 'type': '0', 'Content-Type': 'application/x-www-form-urlencoded', 'accept-encoding': 'gzip', 'user-agent': 'okhttp/4.9.0'}
+        self.baseHeaders = {'token': self.token, 'channel': 'Android', 'version': self.tiShiNengBaseClient.version, 'type': '0'}
+        self.headers = self.baseHeaders
 
     def setSchoolUrl(self, schoolUrl):
         if schoolUrl[-1] == '/':
             schoolUrl = schoolUrl[:-1]
         self.schoolUrl = schoolUrl
+        parsed = urllib.parse.urlparse(schoolUrl)
+        if parsed.netloc:
+            self._host = parsed.netloc
 
     def setAppId(self, appId):
         self.appId = appId
@@ -76,31 +90,26 @@ class TiShiNengPrivate:
         text = self.token + timeStamp
         return self.getMd5(self.getTokenAesEncrypt(text))
 
+    def signerContext(self, timestamp: str) -> 'tsn_signer.SignContext':
+        return tsn_signer.SignContext(token=self.token, timestamp=timestamp, app_id=self.appId, app_secret=self.appSecret, is_open_encry=self.isOpenEncry, token_aes_encrypt=self.getTokenAesEncrypt, md5=self.getMd5)
+
     def getSign2(self, params: dict, timestamp: str):
-        encryptAppId = self.getEncryptAppId(timestamp)
-        encryptAppSecret = self.getEncryptAppSecret(timestamp)
+        """加密签名：委托 signer，输出与原实现逐字节一致。"""
+        ctx = self.signerContext(timestamp)
+        # getSign2 被调用即代表走加密分支，与 isOpenEncry 的当前值无关
+        ctx.is_open_encry = True
+        path = tsn_signer.PRIVATE_ENCRYPTED_PATHS[0]
+        signature = tsn_signer.resolve_signer('2.0.23:private').sign(path, params, ctx)['sign']
         params.pop('sign', None)
-        params.update({'appId': encryptAppId, 'appSecret': encryptAppSecret})
-        keys = list(params.keys())
-        keys.sort()
-        result = []
-        for key in keys:
-            value = params[key]
-            result.append(self.kVtoStr(key, value, False))
-        concatenated_string = '&'.join(result)
-        return self.getTokenAesEncrypt(concatenated_string)
+        params.update({'appId': ctx.md5(ctx.token_aes_encrypt(self.appId + self.token + timestamp)), 'appSecret': ctx.md5(ctx.token_aes_encrypt(self.token + timestamp))})
+        return signature
 
     def getSign(self, params: dict):
+        ctx = self.signerContext('')
+        signature = tsn_signer.resolve_signer('2.0.23:private').sign('/api', params, ctx)['sign']
         params.pop('sign', None)
         params.update({'appId': self.appId, 'appSecret': self.appSecret})
-        keys = list(params.keys())
-        keys.sort()
-        result = []
-        for key in keys:
-            value = params[key]
-            result.append(self.kVtoStr(key, value, False))
-        concatenated_string = '&'.join(result)
-        return self.getMd5(concatenated_string)
+        return signature
 
     async def httpPost(self, url, data):
         url = self.schoolUrl + url
@@ -112,12 +121,12 @@ class TiShiNengPrivate:
             else:
                 sign = self.getSign(data.copy())
             data['sign'] = sign
-            headers = self.headers.copy()
+            headers = self.buildHeaders()
             resp = await self.httpClient.post(url=url, data=data, headers=headers)
             if resp.status_code == 200:
                 try:
                     resp = resp.json()
-                except Exception as e:
+                except Exception:
                     logger.info(resp.text)
                 if resp['returnCode'] == '200':
                     return resp['data']
@@ -232,8 +241,7 @@ class TiShiNengPrivate:
         fileNames = f'avatar{timestamp}.png'
         data = {'userId': self.uid, 'identify': identify, 'timestamp': timestamp}
         sign = self.getSign(data)
-        headers = self.headers.copy()
-        del headers['Content-Type']
+        headers = self.buildHeaders(content_type=None)
         file = {'userId': (None, str(self.uid).encode(), 'multipart/form-data; charset=utf-8'), 'identify': (None, identify.encode(), 'multipart/form-data; charset=utf-8'), 'file': (fileNames, io.BytesIO(faceBytes), 'image/png'), 'timestamp': (None, timestamp.encode(), 'multipart/form-data; charset=utf-8'), 'sign': (None, sign.encode(), 'multipart/form-data; charset=utf-8')}
         resp = await self.httpClient.post(url=url, files=file, headers=headers, timeout=30)
         if resp.status_code == 200:

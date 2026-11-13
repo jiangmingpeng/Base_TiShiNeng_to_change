@@ -1,0 +1,19 @@
+# 本地凭据与运行产物
+tsn_egress.json
+audit/
+face_images/
+breaker.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# 数据库临时文件
+*.db-journal
+*.db-wal
+*.db-shm

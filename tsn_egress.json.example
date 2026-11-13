@@ -1,0 +1,8 @@
+{
+  "_comment": "出口池模板：省必须与学校 province_name 一致；isp 只允许 residential/mobile/broadband/cable/dsl/cellular；同一出口最多 3 个账号（代码硬限制）。复制为 tsn_egress.json 后填入真实代理。",
+  "egresses": [
+    {"url": "http://user:pass@127.0.0.1:8888", "province": "广东", "isp": "mobile", "carrier": "中国移动", "label": "device-as-proxy-gd"},
+    {"url": "http://user:pass@10.0.0.11:3128", "province": "江苏", "isp": "residential", "carrier": "中国电信", "label": "js-home-1"},
+    {"url": "socks5://user:pass@10.0.0.12:1080", "province": "江苏", "isp": "broadband", "carrier": "中国联通", "label": "js-home-2"}
+  ]
+}

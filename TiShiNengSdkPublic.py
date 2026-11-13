@@ -4,7 +4,6 @@ import io
 import json
 import time
 import urllib.parse
-import uuid
 from typing import Dict, Any
 from loguru import logger
 from AesUtils import AESCrypto
@@ -12,12 +11,14 @@ from RsaUtils import RSACrypto
 from TiShiNengError import TiShiNengError
 from TiShiNengSdkBase import TiShiNengSdkBase
 import tsn_environment
+import tsn_fingerprint
 import tsn_routes
 import tsn_payload
+import tsn_signer
 
 class TiShiNengSdkPublic:
 
-    def __init__(self, uid, schoolId, schoolCode, openId, deviceId, brandName, deviceNum, osVersion, token, a_list):
+    def __init__(self, uid, schoolId, schoolCode, openId, deviceId, brandName, deviceNum, osVersion, token, a_list, session=None, proxy=None):
         self.uid = uid
         self.schoolId = schoolId
         self.schoolCode = schoolCode
@@ -30,8 +31,9 @@ class TiShiNengSdkPublic:
         self.appSecret = 'e8167ef026cbc5e456ab837d9d6d9254'
         self.appSign = '7F:C0:22:E6:7C:7D:2A:CC:C3:C8:77:0A:46:13:8D:C3'
         self.cloudUrl = 'http://a.sxstczx.com'
+        self._host = None
         self.platform = '1'
-        self.tiShiNengBaseClient = TiShiNengSdkBase(uid, schoolId, deviceId, brandName, deviceNum, token)
+        self.tiShiNengBaseClient = TiShiNengSdkBase(uid, schoolId, deviceId, brandName, deviceNum, token, session=session, proxy=proxy)
         self.versionName = self.tiShiNengBaseClient.versionName
         self.httpClient = self.tiShiNengBaseClient.getHttpClient()
         self.token = token
@@ -45,9 +47,16 @@ class TiShiNengSdkPublic:
         self.appSignHash = tsn_payload.KNOWN_APP_SIGN_HASH
         self.rsaUtils = RSACrypto('MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAgzQ7BYqBZ5LTjoOb9aHO8fI0hbww9YRW2lnqIdDyIjBwmhthTR+EmiKNm4yFKg6Vz2GW5ix3IdUQdaAq3ZZ7se/dCOTpu3dk15ZgkO6ZImUE7gqzSXXJ0NaACudk4yJwk3Q69kB4m3xIKxiOlG2HtbEed01LrUmLag9VOP96BuSao2sP4Als5hA/8C6KqdihTOcZF1RT+lqrT3Qvja7q+qI5QZw9d7NrFFycQs8jk8O49f9mkvLZRZCCWEbwzuCPTlMy/ZNAsMeU/gNSRKUnquOiPboc2KUhsvY4cK0GeuS9vuIrMGE01L/BCc+rUrautq3n3WiIVJwnwWiJtgk33QIDAQAB')
         self.Cookie = 'host=' + self.schoolCode
-        self.headers = {'model': f'{self.brandName}-{self.deviceNum}', 'uniqueCode': self.deviceId, 'school': self.schoolCode, 'Cookie': self.Cookie, 'accept-encoding': 'gzip', 'user-agent': 'okhttp/4.9.0'}
+        # 业务头（不含 Host/UA 等公共头，公共头由 buildHeaders 统一按 OkHttp 顺序拼装）
+        self.baseHeaders = {'model': f'{self.brandName}-{self.deviceNum}', 'uniqueCode': self.deviceId, 'school': self.schoolCode, 'Cookie': self.Cookie}
+        self.headers = self.baseHeaders
         self.v2BaseDict = {'appType': 'Android', 'versionCode': int(self.tiShiNengBaseClient.version), 'versionName': self.tiShiNengBaseClient.versionName, 'signatureMD5': '7F:C0:22:E6:7C:7D:2A:CC:C3:C8:77:0A:46:13:8D:C3', 'brand': self.brandName, 'model': self.deviceNum, 'system': 'Android', 'version': self.AndroidOsVersion, 'uniqueCode': self.deviceId}
         self.a_list = a_list.split(',')
+
+    def buildHeaders(self, host=None, content_type='application/x-www-form-urlencoded', extra=None):
+        merged = dict(self.baseHeaders)
+        merged.update(extra or {})
+        return tsn_fingerprint.build_headers(host or self._host or 'm.boxkj.com', content_type=content_type, extra=merged)
 
     def isPublic(self):
         return True
@@ -58,7 +67,7 @@ class TiShiNengSdkPublic:
             try:
                 encoded_value = urllib.parse.quote(value)
                 return f'{key}={encoded_value}'
-            except Exception as e:
+            except Exception:
                 return f'{key}={value}'
         else:
             return f'{key}={value}'
@@ -109,7 +118,7 @@ class TiShiNengSdkPublic:
         if 'edu.cn' in cloudUrl:
             parsed = urllib.parse.urlparse(normalized)
             if parsed.netloc:
-                self.headers['Host'] = parsed.netloc
+                self._host = parsed.netloc
 
     def setToken(self, token):
         self.token = token
@@ -141,37 +150,38 @@ class TiShiNengSdkPublic:
         strText = self.token + timeStamp
         return self.getMd5(self.aesUtils.encrypt(strText))
 
+    def signerContext(self, timeStr):
+        return tsn_signer.SignContext(token=self.token, timestamp=timeStr, app_id=self.appId, app_secret=self.appSecret, aes_encrypt=self.aesUtils.encrypt, md5=self.getMd5)
+
     def getSign(self, params: dict, timeStr):
-        params.update({'appId': self.getAesAppid(timeStr), 'appSecret': self.getAesAppSecret(timeStr)})
-        auth_info = tsn_payload.build_auth_info(params)
-        urlDecode = urllib.parse.unquote(auth_info)
-        urlDecode = self.aesUtils.encrypt(urlDecode)
-        return self.getMd5(urlDecode)
+        """签名委托给可插拔 signer（P2-1）；输出与原实现逐字节一致。"""
+        ctx = self.signerContext(timeStr)
+        signature = tsn_signer.resolve_signer('2.0.23:public').sign('/api', params, ctx)['sign']
+        params.update({'appId': ctx.derived_app_id(), 'appSecret': ctx.derived_app_secret()})
+        return signature
 
     def getFaceSign(self, params: dict, timeStr):
-        params.update({'appId': self.getAesAppid(timeStr), 'appSecret': self.getAesAppSecret(timeStr)})
-        auth_info = tsn_payload.build_auth_info(params)
-        aesEncrypted = self.aesUtils.encrypt(urllib.parse.unquote(auth_info))
-        return self.getMd5(aesEncrypted)
+        ctx = self.signerContext(timeStr)
+        signature = tsn_signer.resolve_signer('2.0.23:public-face').sign('/api', params, ctx)['sign']
+        params.update({'appId': ctx.derived_app_id(), 'appSecret': ctx.derived_app_secret()})
+        return signature
 
     async def getAccessToken(self, username, password):
         encPassword = self.passwordAesUtils.encrypt(password, zero_padding=True)
         params = {'username': username, 'password': encPassword, 'grant_type': 'password', 'type': 'app', 'appType': 'stuApp'}
-        headers = self.headers.copy()
         token = self.schoolCode + ':pig'
         base64Token = base64.b64encode(token.encode('utf-8')).decode('utf-8')
-        headers['Authorization'] = 'Basic ' + base64Token
         url = self.cloudUrl + '/' + tsn_routes.route('oauthToken')
+        headers = self.buildHeaders(content_type='application/x-www-form-urlencoded', extra={'Authorization': 'Basic ' + base64Token})
         resp = await self.httpClient.post(url, params=params, headers=headers)
         return resp.json()
 
     async def freshToken(self, freshToken):
         params = {'refresh_token': freshToken, 'scope': 'server', 'grant_type': 'refresh_token', 'type': 'app', 'appType': 'stuApp'}
-        headers = self.headers.copy()
         token = self.schoolCode + ':pig'
         base64Token = base64.b64encode(token.encode('utf-8')).decode('utf-8')
-        headers['Authorization'] = 'Basic ' + base64Token
         url = self.cloudUrl + '/' + tsn_routes.route('oauthToken')
+        headers = self.buildHeaders(content_type='application/x-www-form-urlencoded', extra={'Authorization': 'Basic ' + base64Token})
         resp = await self.httpClient.post(url, params=params, headers=headers)
         return resp.json()
 
@@ -179,11 +189,7 @@ class TiShiNengSdkPublic:
         url = self.cloudUrl + url
         try:
             sign = self.getSign(data.copy(), timestamp)
-            headers = self.headers.copy()
-            headers['sign'] = sign
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
-            headers['timestamp'] = timestamp
-            headers['Authorization'] = 'Bearer ' + self.token
+            headers = self.buildHeaders(extra={'sign': sign, 'timestamp': timestamp, 'Authorization': 'Bearer ' + self.token})
             resp = await self.httpClient.post(url=url, data=data, headers=headers)
             if resp.status_code == 200:
                 resp = resp.json()
@@ -208,10 +214,7 @@ class TiShiNengSdkPublic:
             if timestamp is None:
                 timestamp = str(int(time.time() * 1000))
             sign = self.getSign(params.copy(), timestamp)
-            headers = self.headers.copy()
-            headers['sign'] = sign
-            headers['Authorization'] = 'Bearer ' + self.token
-            headers['timestamp'] = timestamp
+            headers = self.buildHeaders(extra={'sign': sign, 'timestamp': timestamp, 'Authorization': 'Bearer ' + self.token})
             logger.info(f'API请求: {url}, 参数: {params}')
             resp = await self.httpClient.get(url=url, params=params, headers=headers)
             logger.info(f'API响应状态码: {resp.status_code}')
@@ -397,10 +400,7 @@ class TiShiNengSdkPublic:
         key = encParams['key']
         param = encParams['param']
         sign = self.getFaceSign({'key': key, 'param': param}, timestamp)
-        headers = self.headers.copy()
-        headers['sign'] = sign
-        headers['timestamp'] = timestamp
-        headers['Authorization'] = 'Bearer ' + self.token
+        headers = self.buildHeaders(content_type=None, extra={'sign': sign, 'timestamp': timestamp, 'Authorization': 'Bearer ' + self.token})
         file = {'key': (None, key.encode(), 'multipart/form-data; charset=utf-8'), 'param': (None, param.encode(), 'multipart/form-data; charset=utf-8'), 'file': ('file.jpg', io.BytesIO(faceBytes), 'image/png')}
         resp = await self.httpClient.post(url=url, files=file, headers=headers, timeout=30)
         if resp.status_code == 200:

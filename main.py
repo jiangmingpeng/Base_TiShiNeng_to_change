@@ -1,6 +1,7 @@
 import asyncio
+import random
+import sys
 import uuid
-import httpx
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -12,16 +13,27 @@ from tsnClient import tsnPasswordAuthServer, getTsnClientById
 from tsnRunServer import TsnRunServer, TsnRunType
 from spiderServer import startSpider
 from validCountServer import crawl_valid_count_for_account
+import tsn_device
+import tsn_egress
+import tsn_face_provider
+import tsn_fingerprint
+import tsn_policy
+import tsn_runtime
+import tsn_track_sim
 
 def getClient():
     tsn = TiShiNengPrivate(1, 1, '', False, str(uuid.uuid4()), 'Xiaomi', '25053RT47C', '')
     return tsn
 
-def getSchoolInfo(schoolCode):
+async def getSchoolInfo(schoolCode):
+    """学校云地址查询：同样走统一指纹客户端，不暴露 python-httpx UA。"""
     url = f'https://h.tsnkj.com/upms/sysSchool/getSchoolInfo?schoolCode={schoolCode}'
-    resp = httpx.get(url, headers={'User-Agent': 'okhttp/4.9.0'})
-    resp = resp.json()
-    return resp['data']
+    session = tsn_fingerprint.TsnHttpSession()
+    try:
+        resp = await session.get(url, headers=tsn_fingerprint.build_headers('h.tsnkj.com', content_type=None))
+        return resp.json()['data']
+    finally:
+        await session.aclose()
 
 class TsnCliManager:
 
@@ -41,6 +53,7 @@ class TsnCliManager:
         print('4. 爬取路径数据')
         print('5. 更新人脸图片')
         print('6. 查询跑步有效次数和里程')
+        print('7. 环境与指纹自检')
         print('0. 退出系统')
         print('=' * 60)
 
@@ -94,7 +107,7 @@ class TsnCliManager:
                         lan_url = None
                         if school['sysType'] == '2':
                             try:
-                                schoolInfo = getSchoolInfo(school['schoolCode'])
+                                schoolInfo = await getSchoolInfo(school['schoolCode'])
                                 if schoolInfo:
                                     lan_url = schoolInfo.get('url')
                                     if lan_url:
@@ -179,7 +192,7 @@ class TsnCliManager:
                 print('\n正在进行授权验证...')
                 try:
                     uid = await tsnPasswordAuthServer(selected_school.school_id, username, password, db)
-                    print(f'\n✅ 授权成功！')
+                    print('\n✅ 授权成功！')
                     print(f'用户ID: {uid}')
                     print(f'学校: {selected_school.school_name}')
                 except Exception as e:
@@ -309,7 +322,7 @@ class TsnCliManager:
                 print('更新人脸图片任务信息:')
                 print(f'  账号: {selected_account.username}')
                 print(f'  学校: {school_name}')
-                print(f'  说明: 将从服务器下载最新的人脸图片并保存到本地')
+                print('  说明: 将从服务器下载最新的人脸图片并保存到本地')
                 print('=' * 60)
                 confirm = input('\n确认开始更新? (y/n): ').strip().lower()
                 if confirm != 'y':
@@ -368,7 +381,7 @@ class TsnCliManager:
                 print('爬取任务信息:')
                 print(f'  账号: {selected_account.username}')
                 print(f'  学校: {school_name}')
-                print(f'  说明: 将从该账号的历史运动记录中爬取路径数据')
+                print('  说明: 将从该账号的历史运动记录中爬取路径数据')
                 print('=' * 60)
                 confirm = input('\n确认开始爬取? (y/n): ').strip().lower()
                 if confirm != 'y':
@@ -433,12 +446,19 @@ class TsnCliManager:
             logger.exception(e)
             print(f'❌ 操作失败: {str(e)}')
 
+
+    async def environment_selfcheck(self):
+        """离线自检：设备自洽、出口池、HTTP 指纹、人脸池、熔断状态、轨迹物理量。"""
+        self.print_header('环境与指纹自检')
+        report = await run_selfcheck()
+        print(report)
+
     async def run(self):
         await init_db()
         print('\n欢迎使用 TiShiNeng 管理系统!')
         while self.running:
             self.print_menu()
-            choice = input('\n请选择操作 (0-6): ').strip()
+            choice = input('\n请选择操作 (0-7): ').strip()
             if choice == '1':
                 await self.update_school_list()
             elif choice == '2':
@@ -451,6 +471,8 @@ class TsnCliManager:
                 await self.update_face_images()
             elif choice == '6':
                 await self.query_running_distance()
+            elif choice == '7':
+                await self.environment_selfcheck()
             elif choice == '0':
                 print('\n感谢使用，再见!')
                 self.running = False
@@ -459,12 +481,100 @@ class TsnCliManager:
             if self.running:
                 input('\n按 Enter 键继续...')
 
+async def run_selfcheck() -> str:
+    """把 8 个检测面对应的自检项汇总成一份可读报告（不发起任何线上请求）。"""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    lines = []
+    lines.append('--- 1. 设备指纹 ---')
+    async for db in get_db():
+        stmt = select(TsnAccount_Model).options(selectinload(TsnAccount_Model.school))
+        accounts = (await db.execute(stmt)).scalars().all()
+        if not accounts:
+            lines.append('  (库里没有账号，下面用演示档案)')
+            demo = tsn_device.provision_device('demo', '广东省')
+            issues = tsn_device.validate_device_consistency(demo)
+            lines.append(f'  demo: {demo.manufacturer} {demo.model} Android {demo.os_version} android_id={demo.android_id}')
+            if issues:
+                lines.extend(f'  ! {i.code}: {i.message}' for i in issues)
+            else:
+                lines.append('  物理自洽 ✓')
+        for account in accounts:
+            record = await tsn_runtime.ensure_device(account, db)
+            issues = tsn_device.validate_device_consistency(record)
+            school = account.school.school_name if account.school else '-'
+            lines.append(f'  [{account.id}] {account.username} @ {school}: {record.manufacturer} {record.model} Android {record.os_version} ({record.screen_w}x{record.screen_h}@{record.density}) android_id={record.android_id}')
+            if issues:
+                lines.extend(f'    ! {i.code}: {i.message}' for i in issues)
+            else:
+                lines.append('    ✓ 物理自洽')
+        await db.commit()
+
+    lines.append('')
+    lines.append('--- 2. 出口池 ---')
+    pool = tsn_egress.EgressPool.load()
+    if not pool.egresses:
+        lines.append('  未配置 tsn_egress.json：当前所有请求直连，D1/D2 必中')
+        lines.append('  Device-as-Proxy 正确命令（注意是 forward，不是 reverse）:')
+        lines.extend(f'    {cmd}' for cmd in tsn_egress.device_as_commands_preview())
+    else:
+        for province in sorted({e.province for e in pool.egresses}):
+            lines.append('  ' + tsn_egress.egress_report(pool, province).replace('\n', '\n  '))
+
+    lines.append('')
+    lines.append('--- 3. HTTP / TLS 指纹 ---')
+    session = tsn_fingerprint.TsnHttpSession()
+    describe = session.describe()
+    lines.append('  backend=' + describe['backend'] + f'  impersonate={describe["impersonate"]}')
+    lines.append('  | 项 | 值 |')
+    lines.append('  |---|---|')
+    lines.extend('  ' + line for line in tsn_fingerprint.build_session_matrix(describe).splitlines())
+    await session.aclose()
+
+    lines.append('')
+    lines.append('--- 4. 人脸底图池 ---')
+    lines.append(tsn_face_provider.pool_report('demo').replace('\n', '\n  '))
+
+    lines.append('')
+    lines.append('--- 5. 熔断 / 版本 / 审计 ---')
+    breaker = tsn_policy.CircuitBreaker()
+    lines.append('  ' + breaker.snapshot().replace('\n', '\n  '))
+    lines.append('  ' + '本地 APK 版本 2.0.23；漂移检测会切 READ_ONLY')
+    usage = tsn_policy.audit_disk_usage()
+    lines.append(f'  审计目录: {usage["files"]} 文件 / {usage["mb"]} MB')
+
+    lines.append('')
+    lines.append('--- 6. 轨迹物理量（演示 2.5km / 5:00 配速）---')
+    route = [[113.30 + i * 0.0002, 23.10 + i * 0.0001] for i in range(200)]
+    track = tsn_track_sim.simulate_run(route, 2500.0, 1763000000000, 300.0, rng=random.Random(7))
+    stats = tsn_track_sim.describe_simulation(track)
+    lines.append('  ' + json_dumps(stats))
+    geo_issues = tsn_track_sim.validate_geo_constraints(track.points)
+    lines.append('  地理约束: ' + ('通过' if not geo_issues else '; '.join(f'{i.code}' for i in geo_issues)))
+    return '\n'.join(lines)
+
+
+def json_dumps(value) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
 async def main():
     cli = TsnCliManager()
     await cli.run()
+
+
+async def _selftest():
+    await init_db()
+    print(await run_selfcheck())
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        if '--selftest' in sys.argv:
+            asyncio.run(_selftest())
+        else:
+            asyncio.run(main())
     except KeyboardInterrupt:
         print('\n\n程序已被用户中断')
     except Exception as e:

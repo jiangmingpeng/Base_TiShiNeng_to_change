@@ -17,8 +17,35 @@
 4. 从历史运动记录采集可复用路径
 5. 下载并更新人脸图片
 6. 查询跑步有效次数和累计里程
+7. 环境与指纹自检（设备自洽 / 出口池 / TLS 指纹 / 人脸池 / 熔断）
 
 跑步模块包含轨迹清洗、距离预算重采样、速度与步幅计算、60 秒步数分桶、中途人脸验证点排程和提交前数据校验。
+
+## 抗风控层（v0.2）
+
+在原有功能之上补了一层"物理自洽"工程层，目标是让设备、网络、地理、时间、行为五条线始终指向同一个实体。详见 [抗风控落地说明.md](抗风控落地说明.md)。
+
+| 模块 | 作用 |
+|---|---|
+| `tsn_runtime.py` | 账号运行时：设备指纹 + 出口代理 + HTTP 客户端一次装配 |
+| `tsn_device.py` | 账号级确定性设备绑定（学校+学号派生），机型池按省份加权，物理自洽校验 |
+| `tsn_egress.py` | 省内住宅/移动出口绑定、单出口 ≤3 账号、按出口节流、污染组合登记 |
+| `tsn_fingerprint.py` | OkHttp4 指纹：header 顺序、UA、gzip-only、h2 SETTINGS、13 位毫秒、紧凑 JSON |
+| `tsn_signer.py` | 可插拔签名（换版本只换 signer） |
+| `tsn_schedule.py` | 活动日历、双峰开始时间、拟人提交延迟 |
+| `tsn_track_sim.py` | OU 配速、AR(1) GPS 噪声、亚线性步幅、跳点注入、地理硬约束 |
+| `tsn_face_provider.py` | pHash 定向扰动、底图池、活体字段熔断 |
+| `tsn_policy.py` | 错误分类熔断、APK 版本漂移只读、审计落盘、金丝雀门禁 |
+
+自检与验证：
+
+```bash
+python main.py --selftest        # 设备/出口/指纹/人脸池/熔断/轨迹 六项汇总
+python tools/verify_headers.py   # 抓真实字节，核对 header 顺序
+python -m pytest                 # 100 项单测
+```
+
+出口池配置：复制 `tsn_egress.json.example` 为 `tsn_egress.json` 并填入真实代理。未配置时程序直连，并在日志中明确告警（不做「假装安全」的静默降级）。
 
 ## 环境要求
 

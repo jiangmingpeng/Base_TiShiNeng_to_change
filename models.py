@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, Index, UniqueConstraint, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, Index, UniqueConstraint, ForeignKey, BigInteger
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
@@ -58,3 +58,62 @@ class TsnSchool_Model(Base):
 
     def isPublicVersion(self):
         return self.sys_type == 2
+
+
+class TsnDevice_Model(Base):
+    """账号级设备指纹（方案 P0-3）：一个账号锁死一台"物理手机"。"""
+
+    __tablename__ = 'tsn_device'
+    device_pk = Column(String(64), primary_key=True, comment='设备主键')
+    account_id = Column(String(64), ForeignKey('tsn_account.id'), unique=True, nullable=False, comment='绑定账号（1:1）')
+    android_id = Column(String(32), nullable=False, index=True, comment='16 位 hex，账号内恒定')
+    manufacturer = Column(String(64), nullable=False)
+    model = Column(String(64), nullable=False)
+    board = Column(String(64), nullable=False)
+    os_version = Column(String(16), nullable=False)
+    abi = Column(String(32), nullable=False)
+    screen_w = Column(Integer, nullable=False)
+    screen_h = Column(Integer, nullable=False)
+    density = Column(Integer, nullable=False)
+    boot_time_ms = Column(BigInteger, nullable=False, comment='开机时刻（13 位 ms）')
+    apk_version = Column(String(32), nullable=False, default='2.0.23')
+    province = Column(String(32), nullable=True)
+    bound_at = Column(DateTime(timezone=True), server_default=func.now(), comment='绑定时间')
+    last_seen_ip = Column(String(64), nullable=True)
+    last_seen_lat = Column(Float, nullable=True)
+    last_seen_lng = Column(Float, nullable=True)
+
+    def __repr__(self):
+        return f'<TsnDevice(account={self.account_id}, {self.manufacturer} {self.model}, android_id={self.android_id})>'
+
+
+class TsnEgressBinding_Model(Base):
+    """账号 -> 出口 IP 的稳定绑定（方案 P0-1 / P2-4）。"""
+
+    __tablename__ = 'tsn_egress_binding'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(64), ForeignKey('tsn_account.id'), unique=True, nullable=False)
+    egress_key = Column(String(32), nullable=False, index=True, comment='出口哈希，避免明文落库')
+    province = Column(String(32), nullable=True)
+    bound_at = Column(DateTime(timezone=True), server_default=func.now())
+    polluted = Column(Boolean, default=False, comment='该组合是否已被判定污染')
+
+
+class TsnSubmitLog_Model(Base):
+    """每次提交的结果摘要：有效提交率 / 账号存活天数 的数据源（方案 P2-5）。"""
+
+    __tablename__ = 'tsn_submit_log'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(String(64), nullable=False, index=True)
+    run_date = Column(String(10), nullable=False, index=True, comment='YYYY-MM-DD')
+    run_type = Column(Integer, nullable=True)
+    sport_status = Column(String(16), nullable=True, comment='服务端 sportStatus')
+    error_class = Column(String(32), nullable=True)
+    distance_m = Column(Float, nullable=True)
+    elapsed_s = Column(Float, nullable=True)
+    steps = Column(Integer, nullable=True)
+    device_pk = Column(String(64), nullable=True)
+    egress_key = Column(String(32), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index('idx_submit_account_date', 'account_id', 'run_date'),)

@@ -3,11 +3,12 @@ import random
 from typing import List, Optional, Sequence, Tuple
 from track_log import logger
 from step_buckets import DEFAULT_BUCKET_SECONDS, BucketAllocation, StepInterval, allocate_steps
-from track_clean import CleanOptions, InsufficientTrackError, clean_track
+from track_clean import InsufficientTrackError
 from track_geo import EARTH_RADIUS_KM, EARTH_RADIUS_M, METERS_PER_KM, LocalProjection, haversine_distance, normalize_points, point_list_distance
-from track_metrics import cadence_spm, compute_metrics, cumulative_distances, format_pace, pace_seconds_per_km, stride_for_speed, steps_for_interval
-from track_resample import PointRisk, ResampleOptions, ResampledTrack, TrackGenerationError, TrackSample, resample_track
+from track_metrics import cadence_spm, compute_metrics, format_pace, pace_seconds_per_km, stride_for_speed, steps_for_interval
+from track_resample import ResampleOptions, ResampledTrack, TrackGenerationError, resample_track
 from track_validate import ValidationReport, validate_track
+from tsn_track_sim import SimOptions, describe_simulation, offset_total_steps, simulate_run, validate_geo_constraints
 __all__ = ['EARTH_RADIUS_KM', 'EARTH_RADIUS_M', 'METERS_PER_KM', 'TsnRunPolyline', 'genTiShiNengRunPathRepeat', 'generate_run_track', 'to_legacy_points', 'haversine_distance', 'getPointListDistance', 'LocalProjection', 'ResampleOptions', 'ResampledTrack', 'TrackGenerationError', 'InsufficientTrackError']
 
 def getPointListDistance(pointList: Sequence[Sequence[float]]) -> float:
@@ -65,7 +66,56 @@ def generate_run_track(pointList: Sequence[Sequence[float]], needDistance: float
         logger.warning(report.summary())
     return (track, allocation, report)
 
-def genTiShiNengRunPathRepeat(pointList: Sequence[Sequence[float]], needDistance: float, startTimeStamp: float, planUseTime: float, isPublic: bool=True) -> Tuple[List[dict], List[int], float]:
+
+def align_step_fields(result: Sequence[dict], target_total: int) -> List[dict]:
+    """把 legacy 点里的累计步数 ``e`` 对齐到分桶合计。
+
+    服务端会拿步数桶求和与轨迹里的累计步数互相校验，两者差 2 步就是
+    "数据不合格"。这里按比例缩放并强制单调，末点精确等于 ``target_total``。
+    """
+    if not result:
+        return list(result)
+    last = float(result[-1].get('e') or 0)
+    factor = (target_total / last) if last > 0 else 1.0
+    prev = 0
+    for item in result:
+        value = int(round(float(item.get('e') or 0) * factor))
+        value = max(prev, min(target_total, value))
+        item['e'] = value
+        prev = value
+    result[-1]['e'] = target_total
+    if len(result) >= 2:
+        result[-2]['e'] = min(result[-2]['e'], target_total)
+    return list(result)
+
+def genTiShiNengRunPathRepeat(pointList: Sequence[Sequence[float]], needDistance: float, startTimeStamp: float, planUseTime: float, isPublic: bool=True, *, rng: Optional[random.Random]=None, sim: Optional[SimOptions]=None, pace_s_per_km: Optional[float]=None) -> Tuple[List[dict], List[int], float]:
+    """轨迹生成主入口：OU 配速 + AR(1) GPS 噪声 + 跳点 + 步数偏移。
+
+    返回 ``(legacy 点列, 60s 步数桶, 实际总距离)``，与旧实现签名一致，
+    下游 `tsnRunServer` 不需要感知底层换成了物理仿真。
+    """
+    rng = rng or random.Random()
+    sim = sim or SimOptions()
+    pace = pace_s_per_km or planUseTime / max(1e-6, needDistance / 1000.0)
+    track = simulate_run(pointList, needDistance, int(startTimeStamp), pace, rng=rng, options=sim)
+    intervals = [StepInterval(start_offset_s=start, duration_s=duration, steps=steps) for start, duration, steps in track.step_samples()]
+    allocation = allocate_steps(intervals, bucket_seconds=DEFAULT_BUCKET_SECONDS, estimated=False, total_steps=int(round(sum((iv.steps for iv in intervals)))))
+    # 真实记录会漏计/多计 1~2%，但桶内合计必须自洽
+    buckets = offset_total_steps(allocation.buckets, rng, sim.step_offset_ratio)
+    adjusted = BucketAllocation(buckets=buckets, total_steps=sum(buckets), bucket_seconds=allocation.bucket_seconds)
+    report = validate_track(track, bucket_allocation=adjusted, total_steps=adjusted.total_steps, summary_coords=[track.points[0], track.points[-1]])
+    if not report.ok:
+        report.raise_if_failed()
+    geo_issues = validate_geo_constraints(track.points)
+    if geo_issues:
+        logger.warning('地理约束告警: ' + '; '.join(f'{i.code}: {i.message}' for i in geo_issues))
+    result = align_step_fields(to_legacy_points(track, isPublic=isPublic), adjusted.total_steps)
+    logger.info(f'needDistance:{needDistance},sumDistance:{track.total_distance_m} stepBuckets:{len(buckets)}/{adjusted.total_steps} {describe_simulation(track)}')
+    return (result, list(buckets), track.total_distance_m)
+
+
+def genLegacyRunPathRepeat(pointList: Sequence[Sequence[float]], needDistance: float, startTimeStamp: float, planUseTime: float, isPublic: bool=True) -> Tuple[List[dict], List[int], float]:
+    """旧的重采样实现（白噪声速度、无 GPS 噪声），保留用于 A/B 对拍。"""
     track, allocation, report = generate_run_track(pointList=pointList, needDistance=needDistance, startTimeStamp=startTimeStamp, planUseTime=planUseTime, isPublic=isPublic)
     if not report.ok:
         report.raise_if_failed()
